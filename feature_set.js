@@ -1,3 +1,5 @@
+//  THIS IS INTENDED FOR USE IN GOOGLE EARTH ENGINE (GEE)
+
 // load study area
 var ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017");
 var aoi = ecoregions.filter(ee.Filter.eq('ECO_NAME', 'Edwards Plateau savanna'));
