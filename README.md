@@ -1,6 +1,6 @@
 Welcome to the official data and code repository for our paper:
 
-## ** "Integrating NPP, ICESat-2, and Ancillary Data to Model Aboveground Tree Biomass in Savanna Rangelands"** 
+## "Integrating NPP, ICESat-2, and Ancillary Data to Model Aboveground Tree Biomass in Savanna Rangelands"
 
 This study offers a reproducible foundation for carbon accounting, fuel load estimation, biodiversity assessments, and fire planning applications by providing a wall-to-wall regional biomass map of trees in the Edwards Plateau region of Texas. We use net primary productivity accumulation post-fire to create training data for a Random Forest model capable of predicting biomass at a 30 m resolution. Our results are benchmarked against existing GEDI biomass products and data from the U.S. Forest Service Field Inventory and Analysis (FIA) program, and our code also contain measures of uncertainty, spatial autocorrelation, and per-canopy cover class level accuracy for our model.
 
