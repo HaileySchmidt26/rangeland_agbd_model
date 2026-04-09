@@ -1,7 +1,3 @@
-// THIS IS INTENDED FOR GOOGLE EARTH ENGINE (GEE)
-// the table variable (table) refers to the USFS FIA data for CONUS described by Menlove and Healey (2020), and should be downloaded from https://doi.org/10.3390/rs12244141 
-// the image variable (image) refers to the random forest model output generated in the .ipynb script contained within this repository
-
 // ----- set up the rf model output and the study area -----
 // load model output after uploading to assets
 var rfmodelBiomass = image;
@@ -17,6 +13,19 @@ var edPlateau = ecoregions.filter(ee.Filter.eq('ECO_NAME', 'Edwards Plateau sava
 
 // clip model to study area
 var rfmodelMgHa = rfmodelMgHa.clip(edPlateau);
+
+// export converted image if desired
+Export.image.toDrive({
+  image: rfmodelMgHa,
+  description: 'rf_model_biomass_Mg_ha_export',   
+  fileNamePrefix: 'rf_model_biomass_Mg_ha_export', 
+  folder: 'GEE_Exports',                    
+  fileFormat: 'GeoTIFF',                    
+  scale: 30,                                
+  region: edPlateau,           
+  maxPixels: 1e13,
+  crs: 'EPSG:32614'                          
+});
 
 // view the raster on the map
 Map.addLayer(rfmodelMgHa, {min: 0, max: 100}, "RF Model Biomass (clipped)");
@@ -213,6 +222,85 @@ var fiaWithResiduals = fiaComplete.map(function(f) {
 // check FIA residual data to make sure the above worked
 print('Sample FIA feature:', fiaWithResiduals.first());
 
+// keep only features with residuals
+var validFIA = fiaWithResiduals.filter(ee.Filter.notNull(['rf_residual']));
+print('Valid FIA points for residual surface:', validFIA.size());
+
+// base longitude/latitude image
+var baseImage = ee.Image.pixelLonLat();
+
+// build weighted numerator: sum(residual_i * w_i(x))
+var residualWeighted = validFIA.map(function (feature) {
+  var centroid = feature.geometry().centroid();
+  var coords   = centroid.coordinates();
+  var lon      = ee.Number(coords.get(0));
+  var lat      = ee.Number(coords.get(1));
+  var residual = feature.getNumber('rf_residual');
+
+  // distance in meters using degree-to-meter factors (local approximation)
+  var distance = baseImage.expression(
+    'sqrt(pow((pixelLon - pointLon) * 111320, 2) + pow((pixelLat - pointLat) * 110540, 2))',
+    {
+      'pixelLon': baseImage.select('longitude'),
+      'pixelLat': baseImage.select('latitude'),
+      'pointLon': lon,
+      'pointLat': lat
+    }
+  );
+
+  // weight = 1 / (distance + 500)^2
+  var weight = distance.add(500).pow(-2);
+  return weight.multiply(residual);
+});
+
+// denominator: sum of weights
+var denominatorImages = validFIA.map(function (feature) {
+  var centroid = feature.geometry().centroid();
+  var coords   = centroid.coordinates();
+  var lon      = ee.Number(coords.get(0));
+  var lat      = ee.Number(coords.get(1));
+
+  var distance = baseImage.expression(
+    'sqrt(pow((pixelLon - pointLon) * 111320, 2) + pow((pixelLat - pointLat) * 110540, 2))',
+    {
+      'pixelLon': baseImage.select('longitude'),
+      'pixelLat': baseImage.select('latitude'),
+      'pointLon': lon,
+      'pointLat': lat
+    }
+  );
+
+  return distance.add(500).pow(-2);
+});
+
+var numerator = ee.ImageCollection(residualWeighted).sum();
+var denominator = ee.ImageCollection(denominatorImages).sum();
+
+// create residual surface and clip to study area
+var rfResidualFIA = numerator.divide(denominator)
+  .rename('rf_residual_fia')
+  .clip(edPlateau);
+  
+var rfResidualFIA = rfResidualFIA.updateMask(validMaskAll); // clip for spatial consistency
+
+Map.addLayer(
+  rfResidualFIA,
+  { min: -20, max: 20, palette: ['blue', 'lightblue', 'white', 'orange', 'red'] },
+  'RF - FIA Residuals'
+);
+
+// export to Google Drive
+Export.image.toDrive({
+  image: rfResidualFIA,
+  description: 'rf_residuals_toMoransI',     
+  fileNamePrefix: 'rf_residuals_toMoransI',  
+  folder: 'GEE_Exports',                     
+  scale: 30,
+  region: edPlateau.geometry(),
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
 // --------- compute performance metrics --------------------
 // pearsons correlation 
 var gediFiaCorr = fiaComplete.reduceColumns({
@@ -229,6 +317,27 @@ var l4bFiaCorr = fiaComplete.reduceColumns({
   reducer: ee.Reducer.pearsonsCorrelation(),
   selectors: ['l4b_mean', 'CRM_LIVE']
 });
+
+// R-squared
+var calculateRSquared = function(fc, obsCol, predCol) {
+  // Get correlation using the built-in reducer
+  var corrResult = fc.reduceColumns({
+    reducer: ee.Reducer.pearsonsCorrelation(),
+    selectors: [obsCol, predCol]
+  });
+  
+  var correlation = ee.Number(corrResult.get('correlation'));
+  
+  // R-squared is simply correlation squared
+  var rSquared = correlation.pow(2);
+  
+  return rSquared;
+};
+
+// Use the improved version for your calculations
+var gediRSquared = calculateRSquared(fiaComplete, 'CRM_LIVE', 'gedi_mean');
+var rfRSquared = calculateRSquared(fiaComplete, 'CRM_LIVE', 'rf_mean');
+var l4bRSquared = calculateRSquared(fiaComplete, 'CRM_LIVE', 'l4b_mean');
 
 // error
 var fiaWithErrors = fiaComplete.map(function(f) {
@@ -344,19 +453,22 @@ var summaryTable = ee.Dictionary({
     'Correlation': gediFiaCorr.get('correlation'),
     'LinCCC': gediCCC,
     'RMSE': gediRMSE,
-    'Bias': gediBias
+    'Bias': gediBias,
+    'R_squared': gediRSquared
   }),
   'RF_Model': ee.Dictionary({
     'Correlation': rfFiaCorr.get('correlation'),
     'LinCCC': rfCCC,
     'RMSE': rfRMSE,
-    'Bias': rfBias
+    'Bias': rfBias,
+    'R_squared': rfRSquared
   }),
   'GEDI_L4B': ee.Dictionary({
     'Correlation': l4bFiaCorr.get('correlation'),
     'LinCCC': l4bCCC,
     'RMSE': l4bRMSE,
-    'Bias': l4bBias
+    'Bias': l4bBias,
+    'R_squared': l4bRSquared
   })
 });
 
@@ -479,6 +591,36 @@ print('=== GEDI L4B Model Correlations by Canopy Class ===');
 print('Class 1 (0-10%) - R:', gediL4BClass1Corr.get('correlation'));
 print('Class 2 (11-30%) - R:', gediL4BClass2Corr.get('correlation'));
 print('Class 3 (31-100%) - R:', gediL4BClass3Corr.get('correlation'));
+
+// Calculate R-squared for each canopy cover class
+// For canopy cover classes, use the same improved function
+var rfClass1RSquared = calculateRSquared(class1, 'CRM_LIVE', 'rf_mean');
+var rfClass2RSquared = calculateRSquared(class2, 'CRM_LIVE', 'rf_mean');
+var rfClass3RSquared = calculateRSquared(class3, 'CRM_LIVE', 'rf_mean');
+
+var gediClass1RSquared = calculateRSquared(class1, 'CRM_LIVE', 'gedi_mean');
+var gediClass2RSquared = calculateRSquared(class2, 'CRM_LIVE', 'gedi_mean');
+var gediClass3RSquared = calculateRSquared(class3, 'CRM_LIVE', 'gedi_mean');
+
+var gediL4BClass1RSquared = calculateRSquared(class1, 'CRM_LIVE', 'l4b_mean');
+var gediL4BClass2RSquared = calculateRSquared(class2, 'CRM_LIVE', 'l4b_mean');
+var gediL4BClass3RSquared = calculateRSquared(class3, 'CRM_LIVE', 'l4b_mean');
+
+// Print R-squared results by canopy class
+print('=== RF Model R-squared by Canopy Class ===');
+print('Class 1 (0-10%) - R-squared:', rfClass1RSquared);
+print('Class 2 (11-30%) - R-squared:', rfClass2RSquared);
+print('Class 3 (31-100%) - R-squared:', rfClass3RSquared);
+
+print('=== GEDI Model R-squared by Canopy Class ===');
+print('Class 1 (0-10%) - R-squared:', gediClass1RSquared);
+print('Class 2 (11-30%) - R-squared:', gediClass2RSquared);
+print('Class 3 (31-100%) - R-squared:', gediClass3RSquared);
+
+print('=== GEDI L4B Model R-squared by Canopy Class ===');
+print('Class 1 (0-10%) - R-squared:', gediL4BClass1RSquared);
+print('Class 2 (11-30%) - R-squared:', gediL4BClass2RSquared);
+print('Class 3 (31-100%) - R-squared:', gediL4BClass3RSquared);
 
 // export CSV for model - all classes combined with class identifier
 var rfData = class1.select(['rf_mean', 'CRM_LIVE', 'canopy_class'])
