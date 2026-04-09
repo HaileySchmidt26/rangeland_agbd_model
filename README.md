@@ -1,15 +1,15 @@
 Welcome to the official data and code repository for our paper:
 
-## "Integrating NPP, ICESat-2, and Ancillary Data to Model Aboveground Tree Biomass in Savanna Rangelands"
+## "Aboveground Woody Biomass Regression and Uncertainty Estimation from Spaceborne Lidar and Optical Datasets"
 
-This study offers a reproducible foundation for carbon accounting, fuel load estimation, biodiversity assessments, and fire planning applications by providing a wall-to-wall regional biomass map of trees in the Edwards Plateau region of Texas. We use net primary productivity accumulation post-fire to create training data for a Random Forest model capable of predicting biomass at a 30 m resolution. Our results are benchmarked against existing GEDI biomass products and data from the U.S. Forest Service Field Inventory and Analysis (FIA) program, and our code also contain measures of uncertainty, spatial autocorrelation, and per-canopy cover class level accuracy for our model.
+This study offers a reproducible foundation for woody encroachment monitoring, fuel load estimation, and biodiversity assessments by providing a wall-to-wall regional biomass map of trees and shrubs in the Edwards Plateau region of Texas. We use net primary productivity accumulation post-fire to create training data for a Random Forest model capable of predicting biomass at a 30 m resolution. Our results are benchmarked against existing GEDI biomass products and data from the U.S. Forest Service Field Inventory and Analysis (FIA) program, and our code also contain measures of uncertainty, spatial autocorrelation, and per-canopy cover class level accuracy for our model.
 
 ---
 ## 🛰️ Highlights
 - We develop a **scalable cloud-based workflow** to map aboveground woody biomass density at 30 m resolution 
 - Integrates ICESat‑2 height, multispectral imagery, and environmental data as predictors
 - Evaluates the use of **NPP-derived biomass** as training labels for a machine learning model
-- Offers a transferable framework for carbon, fire, and biodiversity applications
+- Offers a transferable framework for woody encroachment, fire, and biodiversity applications
 
 ---
 # 📁 Workflow
@@ -18,8 +18,9 @@ This project utilizes both Google Colaboratory (Colab; .ipynb file) and Google E
 2. feature_set.js
 3. model_script.ipynb
 4. model_comparison.js
+5. model_uncertainty_analysis.js
    
-Note that there will be some back and forth with the two model codes, as the model outputs from Colab will be used in GEE, then the residuals calculated in GEE will need to be brought back into Colab for the spatial and uncertainty analyses.
+Note that there will be some back and forth with the two model codes, as the model outputs from Colab will be used in GEE, then the residuals calculated in GEE will need to be brought back into Colab for the spatial and uncertainty analyses, and then back to GEE.
 
 ---
 # ✏️ Citation
@@ -27,7 +28,7 @@ If you use this work, please cite the paper:
 
 ```bibtex
 @article{melzow2026,
-  title = {Integrating NPP, ICESat-2, and Ancillary Data to Model Aboveground Tree Biomass in Savanna Rangelands},
+  title = {Aboveground Woody Biomass Regression and Uncertainty Estimation from Spaceborne Lidar and Optical Datasets},
   author = {Melzow, Hailey S. and Osorio Leyton, Javier and Popescu, Sorin and Olariu, Horia and Wu, X. Ben},
   journal = {TBA},
   year = {2026},
