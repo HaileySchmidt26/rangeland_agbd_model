@@ -1,0 +1,544 @@
+// ==================================================================================
+// RF MODEL UNCERTAINTY ANALYSIS - Based on SD to RMSE Calibration Workflow
+// ==================================================================================
+// This script implements the uncertainty analysis workflow from the document:
+// Step 1: Aggregate pixels to FIA hexagons (Mean SD, Absolute Error, RMSE)
+// Step 2: Export data for linear regression (SD vs RMSE calibration) in Python
+// Step 3: Apply calibration to create Expected Error Map
+// ==================================================================================
+
+// load model output after uploading to assets
+var rfmodelBiomass = image;  
+
+// you need to also load the ensemble SD raster from your RF model
+// this should be the standard deviation across all trees
+var rfEnsembleSD = image2;  
+
+// convert model output from lbs/acre to Mg/ha
+var conversionFactor = 0.00112085;
+var rfmodelMgHa = rfmodelBiomass.multiply(conversionFactor).rename('rf_model_biomass_Mg_ha');
+
+// ensure the SD file is also in Mg/ha
+var rfEnsembleSD_MgHa = rfEnsembleSD.multiply(conversionFactor).rename('rf_ensemble_sd_Mg_ha');
+
+// define study area
+var ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017");
+var edPlateau = ecoregions.filter(ee.Filter.eq('ECO_NAME', 'Edwards Plateau savanna'));
+
+// clip
+var rfmodelMgHa = rfmodelMgHa.clip(edPlateau);
+var rfEnsembleSD_MgHa = rfEnsembleSD_MgHa.clip(edPlateau);
+
+// define CRS
+var targetCRS = 'EPSG:32614';
+
+// ----- set up NLCD forest mask -----
+var nlcd_landcover = ee.ImageCollection("projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER");
+var forestClasses = [41, 42, 43, 52];
+
+function createForestMask(image) {
+  var forestMask = image.remap(forestClasses, ee.List([1, 1, 1, 1]), 0);
+  return forestMask.updateMask(forestMask.neq(0));
+}
+
+var latestLandCover = nlcd_landcover.sort('system:time_start', false).first();
+var forestMask = createForestMask(latestLandCover).clip(edPlateau);
+
+// apply forest mask to both rasters
+var rfmodelMgHa_masked = rfmodelMgHa.updateMask(forestMask);
+var rfEnsembleSD_masked = rfEnsembleSD_MgHa.updateMask(forestMask);
+
+// ----- load FIA hexagon data -----
+var fiaData = table;
+
+// filter FIA hexagons to study area
+var fiaClipped = fiaData.filterBounds(edPlateau.geometry())
+  .map(function(feature) {
+    return feature.set('contained', edPlateau.geometry().contains(feature.geometry()));
+  })
+  .filter(ee.Filter.eq('contained', true));
+
+print('Total FIA hexagons in Edwards Plateau:', fiaClipped.size());
+
+// ==================================================================================
+// STEP 1: AGGREGATE PIXELS TO FIA HEXAGONS
+// ==================================================================================
+
+// ----- 1.1: Calculate Mean Ensemble SD per Hexagon (σ̄_h) -----
+// This is the average internal model disagreement across all 30m pixels within each hexagon
+
+var meanSDPerHexagon = rfEnsembleSD_masked.reduceRegions({
+  collection: fiaClipped,
+  reducer: ee.Reducer.mean().setOutputs(['mean_ensemble_sd']),
+  scale: 30,
+  crs: targetCRS,
+  tileScale: 8
+});
+
+// ----- 1.2: Calculate Mean Predicted AGBD per Hexagon (Ŷ_h) -----
+var meanPredPerHexagon = rfmodelMgHa_masked.reduceRegions({
+  collection: fiaClipped,
+  reducer: ee.Reducer.mean().setOutputs(['mean_predicted_agbd']),
+  scale: 30,
+  crs: targetCRS,
+  tileScale: 8
+});
+
+// ----- 1.3: Calculate Pixel Count per Hexagon (n_h) -----
+var pixelCountPerHexagon = rfmodelMgHa_masked.reduceRegions({
+  collection: fiaClipped,
+  reducer: ee.Reducer.count().setOutputs(['pixel_count']),
+  scale: 30,
+  crs: targetCRS,
+  tileScale: 8
+});
+
+// ----- Combine all hexagon-level statistics -----
+// first, stack the RF predictions and ensemble SD for combined reduction
+var rfStack = ee.Image.cat([
+  rfmodelMgHa_masked.rename('rf_pred'),
+  rfEnsembleSD_masked.rename('rf_sd')
+]);
+
+// reduce to get mean prediction and mean SD per hexagon
+var hexagonStats = rfStack.reduceRegions({
+  collection: fiaClipped,
+  reducer: ee.Reducer.mean(),
+  scale: 30,
+  crs: targetCRS,
+  tileScale: 8
+});
+
+// ----- Calculate Actual Absolute Error (|ε_h|) and RMSE per Hexagon -----
+// we need to calculate RMSE at the pixel level relative to FIA value
+
+// function to calculate hexagon-level metrics
+var calculateHexagonMetrics = function(hexagon) {
+  var geometry = hexagon.geometry();
+  
+  // get FIA observed value (CRM_LIVE in Mg/ha)
+  var fiaValue = ee.Number.parse(hexagon.get('CRM_LIVE'));
+  
+  // get mean predicted AGBD
+  var meanPred = ee.Number(hexagon.get('rf_pred'));
+  
+  // get mean ensemble SD
+  var meanSD = ee.Number(hexagon.get('rf_sd'));
+  
+  // calculate abs error
+  var absError = meanPred.subtract(fiaValue).abs();
+  
+  // for RMSE, we need to calculate pixel-level squared differences
+  // RMSE_h = sqrt(mean((x_i - Y_h)^2))
+  var fiaImage = ee.Image.constant(fiaValue);
+  var squaredDiff = rfmodelMgHa_masked.subtract(fiaImage).pow(2);
+  
+  var mse = squaredDiff.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('rf_model_biomass_Mg_ha');
+  
+  var rmse = ee.Number(mse).sqrt();
+  
+  // get pixel count
+  var pixelCount = rfmodelMgHa_masked.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('rf_model_biomass_Mg_ha');
+  
+  return hexagon.set({
+    'FIA_observed': fiaValue,
+    'mean_predicted': meanPred,
+    'mean_ensemble_sd': meanSD,
+    'absolute_error': absError,
+    'hexagon_rmse': rmse,
+    'pixel_count': pixelCount
+  });
+};
+
+// filter for valid hexagons first
+var validHexagons = hexagonStats
+  .filter(ee.Filter.notNull(['CRM_LIVE', 'rf_pred', 'rf_sd']))
+  .filter(ee.Filter.neq('rf_pred', null))
+  .filter(ee.Filter.neq('rf_sd', null));
+
+// map the calculation function
+var hexagonsWithMetrics = validHexagons.map(calculateHexagonMetrics);
+
+// filter out any null results
+var hexagonsComplete = hexagonsWithMetrics.filter(
+  ee.Filter.and(
+    ee.Filter.notNull(['mean_ensemble_sd', 'hexagon_rmse', 'absolute_error']),
+    ee.Filter.gt('pixel_count', 0)
+  )
+);
+
+// print if needed
+//print('Hexagons with complete metrics:', hexagonsComplete.size());
+//print('Sample hexagon with metrics:', hexagonsComplete.first());
+
+// ==================================================================================
+// STEP 1 OUTPUTS: Export Calibration Table for Python Analysis
+// ==================================================================================
+
+// export the hexagon-level data for SD vs RMSE calibration plot
+Export.table.toDrive({
+  collection: hexagonsComplete,
+  description: 'hexagon_sd_rmse_calibration_data',
+  fileNamePrefix: 'hexagon_sd_rmse_calibration_data',
+  folder: 'GEE_Exports',
+  fileFormat: 'CSV',
+  selectors: [
+    'FIA_observed',
+    'mean_predicted', 
+    'mean_ensemble_sd',
+    'absolute_error',
+    'hexagon_rmse',
+    'pixel_count'
+  ]
+});
+
+// also export as GeoJSON for spatial analysis
+Export.table.toDrive({
+  collection: hexagonsComplete,
+  description: 'hexagon_sd_rmse_calibration_geojson',
+  fileNamePrefix: 'hexagon_sd_rmse_calibration_geojson',
+  folder: 'GEE_Exports',
+  fileFormat: 'GeoJSON'
+});
+
+// once you're done here, go back to Colab to get the coefficients from the linear regression. then come back and plug the numbers in below
+
+// // ==================================================================================
+// // STEP 2: LINEAR REGRESSION (uncomment out after running analysis in Colab)
+// // ==================================================================================
+
+// // UPDATE BASED ON PYTHON NUMBERS -------------------------------------------------------------------------
+// var slopeB = ee.Number(2.3912070502029534);
+// var interceptA = ee.Number(-5.3058791742636355);
+// var rSquared_SD_RMSE = 0.9290;  
+// var sdRmseCorrelation = Math.sqrt(0.9290);
+
+// // apply the linear calibration model: Expected_Error = a + b * SD
+
+// // create Expected Error map using the linear model
+// // EE_i = a + b * σ_i
+// var expectedErrorMap = rfEnsembleSD_masked
+//   .multiply(slopeB)
+//   .add(interceptA)
+//   .rename('expected_error_Mg_ha');
+
+// // ensure no negative expected errors
+// var expectedErrorMap_positive = expectedErrorMap.max(0);
+
+// // ==================================================================================
+// // STEP 3.1: GENERATE PREDICTION INTERVAL MAPS
+// // ==================================================================================
+
+// // lower bound: AGBD - Expected_Error
+// var predictionLower = rfmodelMgHa_masked
+//   .subtract(expectedErrorMap_positive)
+//   .max(0)  // Ensure non-negative biomass
+//   .rename('prediction_lower_bound');
+
+// // upper bound: AGBD + Expected_Error  
+// var predictionUpper = rfmodelMgHa_masked
+//   .add(expectedErrorMap_positive)
+//   .rename('prediction_upper_bound');
+
+// // prediction interval width
+// var predictionIntervalWidth = predictionUpper
+//   .subtract(predictionLower)
+//   .rename('prediction_interval_width');
+
+// // ==================================================================================
+// // STEP 3.2: CALCULATE COEFFICIENT OF VARIATION (CV) MAP
+// // ==================================================================================
+
+// // CV = (Expected Error / Predicted AGBD) * 100
+// var cvMap = expectedErrorMap_positive
+//   .divide(rfmodelMgHa_masked)
+//   .multiply(100)
+//   .rename('coefficient_of_variation_pct');
+
+// // mask extremely high CV values (where biomass is very low)
+// var cvMap_masked = cvMap.updateMask(cvMap.lt(200));
+
+// // ==================================================================================
+// // EXPORT ALL UNCERTAINTY MAPS
+// // ==================================================================================
+
+// // export Expected Error Map
+// Export.image.toDrive({
+//   image: expectedErrorMap_positive,
+//   description: 'expected_error_map_Mg_ha',
+//   fileNamePrefix: 'expected_error_map_Mg_ha',
+//   folder: 'GEE_Exports',
+//   scale: 30,
+//   region: edPlateau.geometry(),
+//   maxPixels: 1e13,
+//   crs: targetCRS,
+//   fileFormat: 'GeoTIFF'
+// });
+
+// // export Prediction Lower Bound
+// Export.image.toDrive({
+//   image: predictionLower,
+//   description: 'prediction_lower_bound_Mg_ha',
+//   fileNamePrefix: 'prediction_lower_bound_Mg_ha',
+//   folder: 'GEE_Exports',
+//   scale: 30,
+//   region: edPlateau.geometry(),
+//   maxPixels: 1e13,
+//   crs: targetCRS,
+//   fileFormat: 'GeoTIFF'
+// });
+
+// // export Prediction Upper Bound
+// Export.image.toDrive({
+//   image: predictionUpper,
+//   description: 'prediction_upper_bound_Mg_ha',
+//   fileNamePrefix: 'prediction_upper_bound_Mg_ha',
+//   folder: 'GEE_Exports',
+//   scale: 30,
+//   region: edPlateau.geometry(),
+//   maxPixels: 1e13,
+//   crs: targetCRS,
+//   fileFormat: 'GeoTIFF'
+// });
+
+// // export CV Map
+// Export.image.toDrive({
+//   image: cvMap_masked,
+//   description: 'coefficient_of_variation_pct',
+//   fileNamePrefix: 'coefficient_of_variation_pct',
+//   folder: 'GEE_Exports',
+//   scale: 30,
+//   region: edPlateau.geometry(),
+//   maxPixels: 1e13,
+//   crs: targetCRS,
+//   fileFormat: 'GeoTIFF'
+// });
+
+// // export original ensemble SD map for reference
+// Export.image.toDrive({
+//   image: rfEnsembleSD_masked,
+//   description: 'rf_ensemble_sd_Mg_ha',
+//   fileNamePrefix: 'rf_ensemble_sd_Mg_ha',
+//   folder: 'GEE_Exports',
+//   scale: 30,
+//   region: edPlateau.geometry(),
+//   maxPixels: 1e13,
+//   crs: targetCRS,
+//   fileFormat: 'GeoTIFF'
+// });
+
+// // ==================================================================================
+// // SUMMARY STATISTICS
+// // ==================================================================================
+
+// // calculate summary stats for the uncertainty maps
+// var expectedErrorStats = expectedErrorMap_positive.reduceRegion({
+//   reducer: ee.Reducer.mean()
+//     .combine(ee.Reducer.min(), '', true)
+//     .combine(ee.Reducer.max(), '', true)
+//     .combine(ee.Reducer.stdDev(), '', true)
+//     .combine(ee.Reducer.percentile([25, 50, 75]), '', true),
+//   geometry: edPlateau.geometry(),
+//   scale: 30,
+//   maxPixels: 1e13,
+//   tileScale: 8
+// });
+
+// var cvStats = cvMap_masked.reduceRegion({
+//   reducer: ee.Reducer.mean()
+//     .combine(ee.Reducer.min(), '', true)
+//     .combine(ee.Reducer.max(), '', true)
+//     .combine(ee.Reducer.stdDev(), '', true)
+//     .combine(ee.Reducer.percentile([25, 50, 75]), '', true),
+//   geometry: edPlateau.geometry(),
+//   scale: 30,
+//   maxPixels: 1e13,
+//   tileScale: 8
+// });
+
+// var ensembleSDStats = rfEnsembleSD_masked.reduceRegion({
+//   reducer: ee.Reducer.mean()
+//     .combine(ee.Reducer.min(), '', true)
+//     .combine(ee.Reducer.max(), '', true)
+//     .combine(ee.Reducer.stdDev(), '', true)
+//     .combine(ee.Reducer.percentile([25, 50, 75]), '', true),
+//   geometry: edPlateau.geometry(),
+//   scale: 30,
+//   maxPixels: 1e13,
+//   tileScale: 8
+// });
+
+// print('Expected Error Statistics (Mg/ha):', expectedErrorStats);
+// print('Coefficient of Variation Statistics (%):', cvStats);
+// print('Original Ensemble SD Statistics (Mg/ha):', ensembleSDStats);
+
+// // ==================================================================================
+// // VALIDATION: Compare Expected Error vs Actual Error at Hexagon Level
+// // ==================================================================================
+
+// // calculate expected error for each hexagon using the calibration model
+// var hexagonsWithExpectedError = hexagonsComplete.map(function(hexagon) {
+//   var meanSD = ee.Number(hexagon.get('mean_ensemble_sd'));
+//   var actualRMSE = ee.Number(hexagon.get('hexagon_rmse'));
+//   var absError = ee.Number(hexagon.get('absolute_error'));
+  
+//   // apply calibration: Expected_Error = a + b * SD
+//   var expectedError = interceptA.add(slopeB.multiply(meanSD));
+  
+//   // calculate residual (how well calibration works)
+//   var calibrationResidual = actualRMSE.subtract(expectedError);
+  
+//   return hexagon.set({
+//     'expected_error': expectedError,
+//     'calibration_residual': calibrationResidual,
+//     'calibration_residual_abs': calibrationResidual.abs()
+//   });
+// });
+
+// // calculate mean absolute calibration residual (validation metric)
+// var meanCalibrationResidual = hexagonsWithExpectedError.reduceColumns({
+//   reducer: ee.Reducer.mean(),
+//   selectors: ['calibration_residual_abs']
+// });
+
+// print('Mean Absolute Calibration Residual:', meanCalibrationResidual.get('mean'));
+
+// // export validation data
+// Export.table.toDrive({
+//   collection: hexagonsWithExpectedError,
+//   description: 'hexagon_calibration_validation',
+//   fileNamePrefix: 'hexagon_calibration_validation',
+//   folder: 'GEE_Exports',
+//   fileFormat: 'CSV',
+//   selectors: [
+//     'FIA_observed',
+//     'mean_predicted',
+//     'mean_ensemble_sd',
+//     'absolute_error',
+//     'hexagon_rmse',
+//     'expected_error',
+//     'calibration_residual',
+//     'pixel_count'
+//   ]
+// });
+
+// // ==================================================================================
+// // DIAGNOSTIC: Per Canopy Cover Class Uncertainty Analysis
+// // ==================================================================================
+
+// // load RAP canopy cover product
+// var rap = ee.ImageCollection("projects/rap-data-365417/assets/vegetation-cover-v3")
+//   .filterDate('2023-01-01', '2023-12-31')
+//   .select('TRE')
+//   .first();
+
+// // add canopy class to hexagons with metrics
+// var hexagonsWithCanopyClass = hexagonsWithExpectedError.map(function(hex) {
+//   var meanCanopy = rap.reduceRegion({
+//     reducer: ee.Reducer.mean(),
+//     geometry: hex.geometry(),
+//     scale: 30,
+//     maxPixels: 1e9
+//   }).get('TRE');
+  
+//   var canopyValue = ee.Number(meanCanopy);
+//   var canopyClass = ee.Algorithms.If(canopyValue.lte(10), 1,
+//     ee.Algorithms.If(canopyValue.lte(30), 2, 3));
+    
+//   return hex.set({
+//     'canopy_cover': meanCanopy,
+//     'canopy_class': canopyClass
+//   });
+// }).filter(ee.Filter.notNull(['canopy_cover']));
+
+// // split by canopy class for stratified analysis
+// var uncertaintyClass1 = hexagonsWithCanopyClass.filter(ee.Filter.eq('canopy_class', 1));
+// var uncertaintyClass2 = hexagonsWithCanopyClass.filter(ee.Filter.eq('canopy_class', 2));
+// var uncertaintyClass3 = hexagonsWithCanopyClass.filter(ee.Filter.eq('canopy_class', 3));
+
+// // calculate SD vs RMSE correlation per canopy class
+// var sdRmseCorr_Class1 = uncertaintyClass1.reduceColumns({
+//   reducer: ee.Reducer.pearsonsCorrelation(),
+//   selectors: ['mean_ensemble_sd', 'hexagon_rmse']
+// });
+
+// var sdRmseCorr_Class2 = uncertaintyClass2.reduceColumns({
+//   reducer: ee.Reducer.pearsonsCorrelation(),
+//   selectors: ['mean_ensemble_sd', 'hexagon_rmse']
+// });
+
+// var sdRmseCorr_Class3 = uncertaintyClass3.reduceColumns({
+//   reducer: ee.Reducer.pearsonsCorrelation(),
+//   selectors: ['mean_ensemble_sd', 'hexagon_rmse']
+// });
+
+// print('=== SD vs RMSE Correlation by Canopy Class ===');
+// print('Class 1 (0-10% canopy) - R:', sdRmseCorr_Class1.get('correlation'));
+// print('Class 2 (11-30% canopy) - R:', sdRmseCorr_Class2.get('correlation'));
+// print('Class 3 (31-100% canopy) - R:', sdRmseCorr_Class3.get('correlation'));
+
+// print('=== SD vs RMSE R² by Canopy Class ===');
+// var r1 = ee.Number(sdRmseCorr_Class1.get('correlation'));
+// print('Class 1 (0-10% canopy) - R²:', r1.pow(2));
+
+// var r2 = ee.Number(sdRmseCorr_Class2.get('correlation'));
+// print('Class 2 (11-30% canopy) - R²:', r2.pow(2));
+
+// var r3 = ee.Number(sdRmseCorr_Class3.get('correlation'));
+// print('Class 3 (31-100% canopy) - R²:', r3.pow(2));
+// // Check if SD underestimates RMSE (key diagnostic from document)
+// var meanSDClass3 = uncertaintyClass3.reduceColumns({
+//   reducer: ee.Reducer.mean(),
+//   selectors: ['mean_ensemble_sd']
+// }).get('mean');
+
+// var meanRMSEClass3 = uncertaintyClass3.reduceColumns({
+//   reducer: ee.Reducer.mean(),
+//   selectors: ['hexagon_rmse']
+// }).get('mean');
+
+// print('=== Dense Canopy (Class 3) Diagnostic ===');
+// print('Mean Ensemble SD:', meanSDClass3);
+// print('Mean Actual RMSE:', meanRMSEClass3);
+
+// // export stratified uncertainty data
+// Export.table.toDrive({
+//   collection: hexagonsWithCanopyClass,
+//   description: 'hexagon_uncertainty_by_canopy_class',
+//   fileNamePrefix: 'hexagon_uncertainty_by_canopy_class',
+//   folder: 'GEE_Exports',
+//   fileFormat: 'CSV',
+//   selectors: [
+//     'FIA_observed',
+//     'mean_predicted',
+//     'mean_ensemble_sd',
+//     'hexagon_rmse',
+//     'absolute_error',
+//     'expected_error',
+//     'canopy_cover',
+//     'canopy_class',
+//     'pixel_count'
+//   ]
+// });
+
+// var finalSummary = ee.Dictionary({
+//   'Calibration_Model': ee.Dictionary({
+//     'Intercept_a': interceptA,
+//     'Slope_b': slopeB,
+//     'R_squared': rSquared_SD_RMSE
+//   }),
+//   'Validation': ee.Dictionary({
+//     'N_hexagons': hexagonsComplete.size(),
+//     'SD_RMSE_correlation': sdRmseCorrelation
+//   })
+// });
