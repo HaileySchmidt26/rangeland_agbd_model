@@ -4,7 +4,6 @@ Welcome to the official data and code repository for our paper:
 
 
 [![DOI](https://zenodo.org/badge/1113314126.svg)](https://doi.org/10.5281/zenodo.19595970)
-``
 
 
 This study offers a reproducible foundation for woody encroachment monitoring, fuel load estimation, and biodiversity assessments by providing a wall-to-wall regional biomass map of trees and shrubs in the Edwards Plateau region of Texas. We use net primary productivity accumulation post-fire to create training data for a Random Forest model capable of predicting biomass at a 30 m resolution. Our results are benchmarked against existing GEDI biomass products and data from the U.S. Forest Service Field Inventory and Analysis (FIA) program, and our code also contain measures of uncertainty, spatial autocorrelation, and per-canopy cover class level accuracy for our model.
